@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "crates/nomercy-core",
+  "crates/nomercy-cli",
+  "crates/flake",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["NoMercy contributors"]
+
+[workspace.dependencies]
+clap = { version = "4.5.16", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
