@@ -380,6 +380,69 @@ CLI (PRIMARY INTERFACE):
     --ci
     --trace
 
+  Seed selection and reporting:
+    - Default seed is derived deterministically from the adapter manifest hash + engine version (e.g., `seed = siphash(engine_version || manifest_hash)`), ensuring identical seeds for identical inputs when the user omits `--seed`.
+    - CLI prints the seed on the first line of output for every command (`seed=<n>`), even when provided explicitly, so operators can copy/paste it into reruns.
+    - `replay` and `shrink` refuse `--seed` because seed comes from the repro artifact; CLI surfaces the repro’s seed in the header for confirmation.
+
+  Configuration precedence (highest wins):
+    1) CLI flags
+    2) Config file passed via `--config <path>`
+    3) Environment variables (`NOMERCY_*`)
+    - All resolved values are echoed once in deterministic `key=value` lines under a `config:` block; unspecified values are omitted rather than listed as `null`.
+
+  Repro and output layout:
+    - All artifacts for a run live under `./target/nomercy/<system>/` (or a workspace-local cache when outside a repo).
+    - Fresh failures emit `repro.json` and `trace.json` in that directory; shrink writes `repro.shrunk.json` and `trace.shrunk.json` alongside the originals.
+    - Required metadata inside repros:
+        * `engine_version`: semantic version of the CLI/engine binary
+        * `adapter_manifest_hash`: checksum of `adapter.manifest.json` used for the run
+        * `invariant_file_hash`: checksum of the `--invariants` file that was loaded
+        * `seed`, `fault_schedule`, and minimal failing trace
+    - `replay` reads repros in-place and writes no new files unless `--trace` is set (then `trace.replayed.json` is written next to the repro).
+    - All file names and directories are deterministic and referenced verbatim in CLI output to enable copy/paste.
+
+  Exit codes (CI contract):
+    - 0: success / invariant satisfied / replay matched
+    - 1: invariant failure (signals a real finding; CI should fail and archive repro)
+    - 2: protocol error (malformed adapter responses, version mismatch, timeout escalation)
+    - 3: adapter build/generation error (failed to compile or validate adapter)
+    - Any other code: unexpected engine error (CI treats as infrastructure failure and should rerun)
+    - CI guidance: treat 0 as pass, 1 as fail-with-artifact, 2-3 as fail-fast needing investigation; non-listed codes should trigger a retry then escalation.
+
+  Minimal deterministic CLI output (copy/paste friendly):
+    run:
+      ```
+      seed=1234
+      config:
+        invariants=spec/ledger_invariants.json
+        budget=1000
+      adapter=target/nomercy/ledger/nomercy-adapter manifest_hash=9f3b...12
+      replay: nomercy replay target/nomercy/ledger/repro.json
+      status=ok
+      ```
+
+    replay:
+      ```
+      seed=1234
+      repro=target/nomercy/ledger/repro.json
+      adapter=target/nomercy/ledger/nomercy-adapter manifest_hash=9f3b...12
+      status=ok
+      ```
+
+    shrink (after failure):
+      ```
+      seed=1234
+      repro_in=target/nomercy/ledger/repro.json
+      repro_out=target/nomercy/ledger/repro.shrunk.json
+      trace_out=target/nomercy/ledger/trace.shrunk.json
+      adapter_manifest_hash=9f3b...12
+      invariant=ledger.balance_nonnegative
+      status=ok
+      ```
+
+    Failure cases append a single `status=` line with the exit code reason, e.g., `status=invariant_failed` or `status=protocol_error` and always include the repro path when available.
+
   CLI guarantees:
     - Deterministic output
     - Copy-pasteable reproduction info
