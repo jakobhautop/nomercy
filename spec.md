@@ -193,7 +193,20 @@ OBSERVATIONS:
   - Free-form JSON object
   - Deterministic and side-effect free
   - Used exclusively for invariant evaluation
-  - Shape should be stable but is not enforced initially
+  - Stability rules:
+      * Shape must be forward-compatible across an entire run: keys cannot disappear, and field types cannot change once a run begins.
+      * Breaking changes (key removal/type change) require a versioned observation name (e.g., `balances.v2`) that coexists with prior versions for the duration of the run.
+      * Observation producers must tolerate replay: serializing the same state twice yields byte-identical JSON.
+      * Observations consumed by long-running simulations must remain backward compatible for the run duration; migrations happen between runs via explicit version bumps.
+  - Deterministic serialization requirements:
+      * Canonical JSON: stable key ordering, deterministic number formatting, and no incidental fields (timestamps, random IDs).
+      * No binary blobs; payloads must be UTF-8 JSON and should avoid base64 unless essential.
+      * Observations must not exceed recommended limits: 256 KiB per observation, max nesting depth of 8, and no arrays longer than 10,000 elements.
+      * Serialization is pure: identical input state yields byte-identical output, including field ordering and whitespace.
+  - Recommended payload limits:
+      * Prefer summarized counts over unbounded lists; explicitly document truncation behavior if applied.
+      * If truncation occurs, include deterministic markers (e.g., `"truncated": true`, `"omitted": 42`).
+      * Avoid embedding unbounded histories; favor snapshots with deterministic ordering.
 
 INVARIANTS:
   - Defined outside the system
@@ -203,13 +216,71 @@ INVARIANTS:
       * every crash
       * every restore
   - Any violation immediately stops the run
+  - Naming rules:
+      * Required `snake_case` identifier; optional namespace via dot segments (e.g., `ledger.balance_nonnegative`, `session.always_progress`).
+      * Names are immutable within a run; changes require a new invariant entry.
+  - Failure surfacing:
+      * Repro artifacts must record the failing invariant name, predicate, observation snapshot, and human-readable failure message.
+      * Failure messages are deterministic, single-line strings that reference concrete values (no flakiness hints like "maybe").
+      * Repro stores both pre- and post-shrink invariant failures with the same structure for byte-identical replay.
+      * Repro invariants section shape:
+          - `invariants`: array of objects with `name`, `predicate`, `message`, and `observation` as captured at failure.
+          - Each entry also records `step` and `fault_schedule` references for replay.
 
-  Invariant DSL (initial, declarative):
-    - forall <path> <predicate>
-    - sum(<path>) == <value>
-    - equality and ordering only
-    - no user-defined functions
-    - deterministic evaluation only
+  Invariant representation (canonical, binding-friendly):
+    - User-facing APIs are language-native (e.g., Rust macros, decorators); users never write a separate DSL.
+    - Bindings compile language-native predicates into a canonical declarative form consumed by nomercy-core.
+    - Supported predicate building blocks:
+        * forall <path> <predicate>
+        * sum(<path>) == <value>
+        * Equality and ordering checks
+        * Deterministic evaluation only; no user-defined functions
+    - Binding responsibility:
+        * Reject host-language predicates that cannot be lowered to the canonical form.
+        * Preserve invariant names and messages verbatim when emitting canonical predicates.
+  Invariant file structure:
+    - Format: JSON file provided via `--invariants <file>`.
+    - Top-level: array of invariant objects `{ "name": <string>, "predicate": <canonical-predicate>, "message": <string> }`.
+    - Parsing rules:
+        * Unknown fields are rejected with a validation error that lists the offending keys.
+        * Missing `name`, `predicate`, or `message` fields are fatal at load time.
+        * Duplicate names in the file are rejected before simulation starts.
+    - Validation errors:
+        * Reported deterministically with file offset/line when available and echoed in CLI output.
+        * Engine refuses to start if any invariant fails to parse or validate.
+  Observation and invariant examples:
+    - Observation payload:
+        ```
+        {
+          "balances": { "alice": 10, "bob": -1 },
+          "transfers": [{ "from": "bob", "to": "alice", "amount": 1, "sequence": 42 }],
+          "truncated": false
+        }
+        ```
+    - Corresponding invariants:
+        * Non-negative balances:
+          ```
+          { "name": "ledger.balance_nonnegative",
+            "predicate": "forall balances.* >= 0",
+            "message": "negative balance detected in balances.*" }
+          ```
+          Failure message example: `negative balance detected in balances.bob: -1`
+        * Sequence monotonicity:
+          ```
+          { "name": "ledger.sequence_monotonic",
+            "predicate": "forall transfers[*].sequence is strictly_increasing",
+            "message": "transfer sequences must be strictly increasing" }
+          ```
+          Failure message example: `transfer sequences must be strictly increasing: saw 42 then 40`
+        * Sum conservation:
+          ```
+          { "name": "ledger.sum_preserved",
+            "predicate": "sum(balances.*) == 0",
+            "message": "ledger sum drifted: expected 0" }
+          ```
+          Failure message example: `ledger sum drifted: expected 0, saw 9`
+    - Observation versioning example:
+        * Observation `balances.v1` continues emitting `{ "balances": { ... } }` while new observation `balances.v2` adds `"currency": "USD"`; invariants referencing v1 remain valid during the run, and new invariants can target v2 with names like `ledger_v2.balance_nonnegative`.
 
 FAULT MODEL:
   - All faults are deterministic and scheduled
