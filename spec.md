@@ -224,12 +224,48 @@ FAULT MODEL:
     - Are injected only by nomercy
     - Are visible in traces
     - Must be shrinkable
+  Semantics:
+    - Targetability by protocol command:
+        * crash: may be scheduled against `init`, `apply`, `restore`, or `observe` because all can trigger system-side persistence; forbidden against `shutdown`.
+        * io_error: only applies to `apply` (simulated user operations) to model retryable adapter/system IO failures.
+        * delay:<resource>: applies to any command that touches that resource; resources are adapter-defined identifiers (e.g., `storage`, `network`).
+    - Step addressing:
+        * Steps are scheduler-issued command indices starting at 1 for the first `init`.
+        * `delay` duration is measured in logical scheduler steps, not wall-clock time; a `delay:storage@5+2` blocks resource `storage` for steps 5 and 6 and releases before step 7.
+    - Ordering and conflicts:
+        * Multiple faults on the same step are ordered deterministically by (step, fault type, resource/name) to guarantee stable replay; canonical sort order is crash < io_error < delay and lexicographic within equal types.
+        * Conflicting faults targeting the same command (e.g., crash@3 and io_error@3) are applied in canonical order until one makes the command abort; remaining faults for that step are still recorded but may become no-ops if the command never executes.
+        * Overlapping delays on the same resource coalesce by taking the maximum end step; delays on distinct resources coexist.
+    - Replay and shrinking guarantees:
+        * Fault schedules are normalized to canonical ordering before execution and persisted in repros; shrinker preserves ordering and only removes or retimes faults.
+        * When shrinking ties (two faults retimed to same step), canonical ordering is re-applied so replay stays byte-identical.
+        * Shrink preference order still applies (fewer steps → fewer operations → fewer faults → earlier timing) and never violates determinism.
+
+  Fault schedule examples:
+    - Basic schedule:
+        * Step 1: init
+        * Step 2: apply(opA) with io_error@2
+        * Step 3: apply(opB)
+        * Step 4: observe
+    - Overlapping and normalized schedule:
+        * User-specified: crash@5, io_error@5, delay:storage@4+3, delay:network@6+1
+        * Normalized execution order:
+            - Step 4: delay:storage starts (covers steps 4-6)
+            - Step 5: crash then io_error (io_error may be moot if crash prevents completion)
+            - Step 6: delay:storage continues; delay:network starts (covers step 6)
+        * Shrink behavior example:
+            - If shrinker retimes io_error@5 to @4, canonical ordering becomes: delay:storage@4+3, io_error@4, crash@5; replay uses this exact ordering even though faults overlap.
 
 SCHEDULER:
   - Step-based and deterministic
   - Single logical clock
   - No threads, sleeps, or wall-clock time
   - Same seed + config => identical execution
+  Semantics:
+    - Commands are issued sequentially: init → apply* → (crash/restore pairs) → observe → shutdown; each issuance consumes one step index.
+    - Delays pause issuance of commands that target a blocked resource; paused commands are retried at the next step once all relevant delays expire.
+    - Canonical fault ordering is applied per step before execution; when multiple faults affect the same step, scheduler executes them in canonical order and records no-ops explicitly for replay.
+    - Shrinker replays using the same scheduler; normalized fault schedules ensure shrink steps map 1:1 to replay steps even when timing ties occur.
 
 SIMULATION LOOP:
   - Choose seed
