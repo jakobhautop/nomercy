@@ -61,6 +61,32 @@ ADAPTER MODEL (AUTO-GENERATED):
         * Speaks the nomercy protocol
         * Delegates all logic to user code
 
+  Artifact format (language bindings):
+    - Bindings emit a self-contained adapter bundle with:
+        * Executable entrypoint named `nomercy-adapter` (binary or script depending on language)
+        * Adjacent manifest file `adapter.manifest.json`
+        * Optional language-native wrapper files (e.g., generated Rust crate sources) stored under `src/` inside the bundle
+    - Manifest contents:
+        * Protocol + generator version
+        * Supported operations and shapes (op names, argument schemas)
+        * Config schema (JSON Schema) for `init(config)`
+        * Hashes of generator inputs (source files, binding version, core version, protocol version)
+        * Invocation metadata (expected working directory, environment knobs)
+    - Invocation contract:
+        * Entrypoint consumes manifest path via `--manifest <path>` and speaks over stdin/stdout
+        * CLI runs: `./nomercy-adapter --manifest adapter.manifest.json`
+        * Entrypoint must refuse to start if manifest hash check fails
+
+  Example (Rust project using nomercy):
+    - Binding produces a generated crate at `target/nomercy/adapters/<system_name>/` containing:
+        * `src/adapter_main.rs` and glue code for annotations/derive macros
+        * Cargo metadata wired to depend on `nomercy-core` protocol types only
+        * Built binary at `target/nomercy/adapters/<system_name>/nomercy-adapter`
+        * `adapter.manifest.json` describing ops/config schema derived from Rust attributes
+    - CLI invocation during `nomercy run`:
+        * If the binary is missing or the manifest hash mismatches, run `cargo run -p nomercy-adapter-<system_name> -- --manifest adapter.manifest.json`
+        * Execution happens inside the workspace root so relative module paths resolve
+
   Properties:
     - Generated automatically (build-time or run-time)
     - Inspectable artifacts
@@ -73,6 +99,29 @@ ADAPTER MODEL (AUTO-GENERATED):
     - Adapter: protocol translation only
     - nomercy-core: authority over time, faults, crashes, invariants
     - User system: pure business logic + state transitions
+
+  Generation timing and determinism:
+    - Default flow: adapters are generated at build time (binding-specific build step) and validated on first CLI run
+    - First-run safeguard: if no artifact exists or hashes drift, CLI triggers regeneration before executing schedules
+    - Determinism enforcement:
+        * Generator computes a checksum over: user-decorated sources, binding version, nomercy-core version, protocol version, generator flags, manifest schema
+        * Checksum is stored in `adapter.manifest.json` and mirrored in a `adapter.checksum` file inside the bundle
+        * CLI recomputes the checksum before each run; mismatch => refuse to execute stale adapter and regenerate
+        * Build systems (e.g., Cargo) cache by checksum; identical inputs must produce byte-identical adapter binaries
+    - Artifact location:
+        * Repository-local: `./target/nomercy/adapters/<system_name>/` for build products committed to workspace cache (never checked in)
+        * Workspace-local (non-repo runs): `~/.cache/nomercy/adapters/<system_name>/` as a fallback when build directories are ephemeral
+
+  Failure surfacing rules (CLI UX):
+    - Generation failure is fatal and must be reported before simulation begins
+    - CLI error message includes:
+        * Generator command executed and exit code
+        * Path to captured stdout/stderr log (e.g., `target/nomercy/adapters/<system_name>/build.log`)
+        * Next action the user can run verbatim (e.g., `cargo run -p nomercy-adapter-<system_name> -- --manifest adapter.manifest.json`)
+        * Hash summary of inputs (binding/core/protocol versions) to confirm drift
+    - CLI must not reuse stale artifacts on failure; it either regenerates successfully or aborts
+    - Logs are kept alongside the adapter bundle and referenced directly in the failure message
+    - Retry guidance must be copy-pasteable and deterministic (no “maybe” advice)
 
 PROTOCOL:
   - Transport: stdin / stdout
