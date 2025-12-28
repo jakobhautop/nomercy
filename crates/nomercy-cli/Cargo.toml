@@ -1,0 +1,12 @@
+[package]
+name = "nomercy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+nomercy-core = { path = "../nomercy-core" }
+serde_json.workspace = true
+flake = { path = "../flake" }
