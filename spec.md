@@ -79,13 +79,61 @@ PROTOCOL:
   - Encoding: line-delimited JSON
   - nomercy is authoritative; adapter/system is reactive
 
+  Protocol versioning:
+    - All commands include a required `version` field (semantic version string)
+    - Engine sends its current version with every request; adapters must respond with the same version
+    - Mismatched or missing versions are fatal: engine aborts the session and records a repro
+
+  Command lifecycle and shutdown semantics:
+    - `shutdown` means: stop accepting new commands, flush any buffered output, exit cleanly
+    - “End of run” means: engine finished the current schedule and will either issue `shutdown` or start a new replay/run; no additional side effects are implied
+    - Engines never infer shutdown from EOF; explicit `shutdown` is required for clean teardown
+
   Commands sent by nomercy:
-    { "cmd": "init", "config": {...} }
-    { "cmd": "apply", "op": {...} }
-    { "cmd": "crash" }
-    { "cmd": "restore", "state": {...} }
-    { "cmd": "observe" }
-    { "cmd": "shutdown" }
+    { "version": "x.y.z", "cmd": "init", "config": {...} }
+    { "version": "x.y.z", "cmd": "apply", "op": {...} }
+    { "version": "x.y.z", "cmd": "crash" }
+    { "version": "x.y.z", "cmd": "restore", "state": {...} }
+    { "version": "x.y.z", "cmd": "observe" }
+    { "version": "x.y.z", "cmd": "shutdown" }
+
+  Error handling and response schema:
+    - Success: { "ok": true }
+    - Retryable error: { "error": "...", "retryable": true, "fatal": false }
+    - Fatal error: { "error": "...", "fatal": true }
+    - Observation response (unchanged): { "observation": {...} }
+    - Unknown fields in adapter responses are ignored but recorded in trace for debugging
+    - Invalid JSON or missing required fields => fatal; engine aborts and emits repro
+
+    Example responses:
+      - Retryable: { "error": "transient IO", "retryable": true, "fatal": false }
+      - Fatal: { "error": "state divergence", "fatal": true }
+
+    Engine decisions (simplified):
+      | Condition                                 | Engine action                |
+      |-------------------------------------------|-----------------------------|
+      | Retryable error on apply/init/observe     | Retry command (bounded)     |
+      | Fatal error flag                          | Abort run, emit repro       |
+      | Invalid/malformed JSON                    | Abort run, emit repro       |
+      | Version mismatch                          | Abort session, emit repro   |
+      | Max retries exceeded                      | Abort run, emit repro       |
+
+  Adapter timeouts & backpressure:
+    - Max bytes per line: 64 KiB (lines exceeding are truncated and marked)
+    - Max response latency: 5s default per command (configurable); exceeding triggers timeout
+    - On timeout: engine treats as retryable once; repeated timeout becomes fatal
+    - On truncation/partial write: engine marks response as incomplete, aborts current run, and records repro with raw line
+    - Adapters must flush stdout after every response; engine never waits for stderr
+
+  JSON validity and unknown fields:
+    - Lines must be well-formed JSON objects
+    - Unknown fields are tolerated but not acted upon; schema-required fields must be present
+    - Fields with wrong types are treated as malformed JSON => fatal abort
+
+  Idempotency and retries:
+    - `apply` must be idempotent across retries: identical command replays must not produce diverging state
+    - Engine may retry `apply` after retryable errors or timeouts; adapters must ensure apply replay is safe
+    - `init`, `restore`, and `observe` are treated as pure/side-effect-free relative to retries
 
   Responses from adapter/system:
     { "ok": true }
