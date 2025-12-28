@@ -51,8 +51,42 @@ SYSTEM MODEL:
   Notes:
     - These capabilities are exposed via generated adapters
     - Users express them via language-native annotations or decorators
-    - Scheduling, faults, and retries are controlled exclusively by nomercy
+    - Scheduling, faults, and command replays are controlled exclusively by nomercy
     - Anything not explicitly persisted is lost on crash
+
+DETERMINISM CONTRACT (NORMATIVE):
+  A system is deterministic under nomercy if and only if:
+    1. Identical command sequences produce byte-identical crash persisted state and observations.
+    2. Execution does not depend on wall-clock time, randomness, or ambient process state (environment variables, locale, filesystem layout).
+    3. Iteration over unordered collections is forbidden.
+    4. Floating-point behavior is deterministic across executions and platforms, or floating-point types are avoided entirely.
+    5. All serialization is canonical and stable.
+  Violations:
+    - Detected by bindings before execution
+    - Rejected prior to running any schedules
+    - Never deferred to runtime simulation
+
+DETERMINISM QUALIFICATION (MANDATORY PRE-RUN):
+  Command:
+    - `nomercy beg <system>`
+  Purpose:
+    - Statistically and structurally validate determinism requirements
+    - Fail before any simulation, fault injection, or invariant evaluation
+  Rules:
+    - Systems that fail qualification MUST NOT be executed
+    - Qualification failure is a system error, not a simulation failure
+    - Qualification is binding-defined and engine-enforced
+  Qualification checks (non-exhaustive, binding-specific):
+    - Use of nondeterministic APIs (time, randomness, UUIDs, ambient environment)
+    - Iteration over unordered collections
+    - Non-canonical or unstable serialization (including observation serialization determinism)
+    - Crash/restore payload determinism and closure
+    - Presence of undeclared side effects
+  CLI behavior:
+    - `nomercy pray` implicitly performs qualification if it has not already succeeded
+    - Qualification failures abort immediately with a system error
+  Exit code:
+    - 4: system_not_deterministic
 
 ADAPTER MODEL (AUTO-GENERATED):
   Definition:
@@ -83,7 +117,7 @@ ADAPTER MODEL (AUTO-GENERATED):
         * Cargo metadata wired to depend on `nomercy-core` protocol types only
         * Built binary at `target/nomercy/adapters/<system_name>/nomercy-adapter`
         * `adapter.manifest.json` describing ops/config schema derived from Rust attributes
-    - CLI invocation during `nomercy run`:
+    - CLI invocation during `nomercy pray`:
         * If the binary is missing or the manifest hash mismatches, run `cargo run -p nomercy-adapter-<system_name> -- --manifest adapter.manifest.json`
         * Execution happens inside the workspace root so relative module paths resolve
 
@@ -95,10 +129,33 @@ ADAPTER MODEL (AUTO-GENERATED):
     - Contain zero fault logic
     - Deterministic pass-through only
 
+  Adapter Purity Rules:
+    - MUST NOT:
+        * Generate identifiers
+        * Read system or monotonic time
+        * Access environment variables except those explicitly declared in the manifest
+        * Perform filesystem, network, or other IO beyond stdin/stdout
+        * Perform command replays, caching, buffering, or speculative execution
+        * Contain simulation, fault, scheduling, or invariant logic
+    - MUST:
+        * Forward each engine command exactly once
+        * Emit exactly one response per command
+        * Flush stdout after every response
+        * Behave purely as protocol translation
+    - Violations are treated as protocol violations and abort execution immediately.
+
   Responsibility split:
     - Adapter: protocol translation only
     - nomercy-core: authority over time, faults, crashes, invariants
     - User system: pure business logic + state transitions
+
+TERMINOLOGY NORMALIZATION:
+  - “test failure” => “counterexample found”
+  - “retry” => “command replay”
+  - “timeout” => “protocol timeout”
+  - “flaky” => MUST NOT appear
+  - “test run” => “simulation run”
+  - All CLI output and documentation MUST adopt this language consistently.
 
   Generation timing and determinism:
     - Default flow: adapters are generated at build time (binding-specific build step) and validated on first CLI run
@@ -125,7 +182,7 @@ ADAPTER MODEL (AUTO-GENERATED):
         * Hash summary of inputs (binding/core/protocol versions) to confirm drift
     - CLI must not reuse stale artifacts on failure; it either regenerates successfully or aborts
     - Logs are kept alongside the adapter bundle and referenced directly in the failure message
-    - Retry guidance must be copy-pasteable and deterministic (no “maybe” advice)
+    - Command replay guidance must be copy-pasteable and deterministic (no “maybe” advice)
 
 PROTOCOL:
   - Transport: stdin / stdout
@@ -152,7 +209,7 @@ PROTOCOL:
 
   Error handling and response schema:
     - Success: { "version": "x.y.z", "ok": true }
-    - Retryable error: { "version": "x.y.z", "error": "...", "retryable": true, "fatal": false }
+    - Replayable error (command replay allowed): { "version": "x.y.z", "error": "...", "retryable": true, "fatal": false }
     - Fatal error: { "version": "x.y.z", "error": "...", "fatal": true }
     - Observation response: { "version": "x.y.z", "observation": {...} }
     - Crash response: { "version": "x.y.z", "ok": true, "state": {...} } where `state` is the persisted payload that restore consumes.
@@ -161,25 +218,25 @@ PROTOCOL:
     - Invalid JSON or missing required fields (including `version`) => fatal; engine aborts and emits repro
 
     Example responses:
-      - Retryable: { "version": "1.2.3", "error": "transient IO", "retryable": true, "fatal": false }
+      - Replayable: { "version": "1.2.3", "error": "transient IO", "retryable": true, "fatal": false }
       - Fatal: { "version": "1.2.3", "error": "state divergence", "fatal": true }
       - Observation: { "version": "1.2.3", "observation": { "balances": { "alice": 10 } } }
       - Crash with persisted state: { "version": "1.2.3", "ok": true, "state": { "disk": { ... } } }
 
     Engine decisions (simplified):
-      | Condition                                 | Engine action                |
-      |-------------------------------------------|-----------------------------|
-      | Retryable error on init/apply/observe     | Retry command (bounded)     |
-      | Timeout on retryable command              | Retry once, then fatal      |
-      | Fatal error flag                          | Abort run, emit repro       |
-      | Invalid/malformed JSON                    | Abort run, emit repro       |
-      | Version mismatch                          | Abort session, emit repro   |
-      | Max retries exceeded                      | Abort run, emit repro       |
+      | Condition                                  | Engine action                 |
+      |--------------------------------------------|------------------------------|
+      | Replayable error on init/apply/observe     | Command replay (bounded)     |
+      | Protocol timeout on replayable command     | Command replay once, then fatal      |
+      | Fatal error flag                           | Abort run, emit repro        |
+      | Invalid/malformed JSON                     | Abort run, emit repro        |
+      | Version mismatch                           | Abort session, emit repro    |
+      | Max command replays exceeded               | Abort run, emit repro        |
 
-  Adapter timeouts & backpressure:
+  Adapter protocol timeouts & backpressure:
     - Max bytes per line: 64 KiB (lines exceeding are truncated and marked)
-    - Max response latency: 5s default per command (configurable); exceeding triggers timeout
-    - On timeout: engine treats as retryable once; repeated timeout becomes fatal. Timeout replay captures the raw command, missing response marker, and whether a retry was issued in the trace.
+    - Max response latency: 5s default per command (configurable); exceeding triggers a protocol timeout
+    - On protocol timeout: engine permits a single command replay; repeated timeout becomes fatal. Timeout replay captures the raw command, missing response marker, and whether a replay was issued in the trace.
     - On truncation/partial write: engine marks response as incomplete, aborts current run, and records repro with raw line
     - Adapters must flush stdout after every response; engine never waits for stderr
 
@@ -188,16 +245,16 @@ PROTOCOL:
     - Unknown fields are tolerated but not acted upon; schema-required fields must be present
     - Fields with wrong types are treated as malformed JSON => fatal abort
 
-  Idempotency and retries:
-    - `apply` must be idempotent across retries: identical command replays must not produce diverging state.
-    - Command retry + idempotency matrix:
-        * `init`: may be retried once on retryable error/timeout; must recreate identical initial state and persisted artifacts.
-        * `apply`: may be retried; must be idempotent with respect to both volatile and persisted state.
-        * `restore`: may be retried; must be a pure function of the provided `state` and must not attempt external recovery side effects.
-        * `observe`: may be retried; must be read-only and deterministic.
-        * `crash`: may be retried; must emit identical `state` payloads across retries and must not attempt to continue execution after emitting state.
-        * `shutdown`: must not be retried; timeouts are treated as fatal.
-    - Engine may retry `init`, `apply`, `restore`, `observe`, and `crash` once after retryable errors or timeouts; adapters must ensure replay is safe. Non-retryable/fatal errors abort immediately.
+  Idempotency and command replays:
+    - `apply` must be idempotent across command replays: identical command replays must not produce diverging state.
+    - Command replay + idempotency matrix:
+        * `init`: may be replayed once on replayable error/protocol timeout; must recreate identical initial state and persisted artifacts.
+        * `apply`: may be replayed; must be idempotent with respect to both volatile and persisted state.
+        * `restore`: may be replayed; must be a pure function of the provided `state` and must not attempt external recovery side effects.
+        * `observe`: may be replayed; must be read-only and deterministic.
+        * `crash`: may be replayed; must emit identical `state` payloads across replays and must not attempt to continue execution after emitting state.
+        * `shutdown`: must not be replayed; protocol timeouts are treated as fatal.
+    - Engine may replay `init`, `apply`, `restore`, `observe`, and `crash` once after replayable errors or protocol timeouts; adapters must ensure replay is safe. Non-replayable/fatal errors abort immediately.
 
   Responses from adapter/system must echo `version`:
     { "version": "x.y.z", "ok": true }
@@ -210,9 +267,9 @@ PROTOCOL:
     - Restore requests replay the exact payload previously emitted by crash: { "version": "x.y.z", "cmd": "restore", "state": <state-object> }.
     - Engine behavior:
         * Every crash response line is recorded verbatim in the trace, including `state`; repros persist the latest crash `state` used during the failing schedule and include it in both `trace.json` and `repro.json`.
-        * On timeout before a crash response, engine records a timeout marker and may retry once; if a retry succeeds, the persisted `state` from the successful retry is what traces/repros capture.
+        * On protocol timeout before a crash response, engine records a timeout marker and may command replay once; if a replay succeeds, the persisted `state` from the successful replay is what traces/repros capture.
         * Mismatched/malformed `state` during restore (type mismatch, missing required keys per manifest) is fatal and recorded with the offending payload.
-    - Adapters must guarantee that repeated crash executions under retry produce byte-identical `state` payloads so restore replay is deterministic.
+    - Adapters must guarantee that repeated crash executions under command replay produce byte-identical `state` payloads so restore replay is deterministic.
 
 OBSERVATIONS:
   - Free-form JSON object
@@ -364,7 +421,7 @@ FAULT MODEL:
   Semantics:
     - Targetability by protocol command:
         * crash: may be scheduled against `init`, `apply`, `restore`, or `observe` because all can trigger system-side persistence; forbidden against `shutdown`.
-        * io_error: only applies to `apply` (simulated user operations) to model retryable adapter/system IO failures.
+        * io_error: only applies to `apply` (simulated user operations) to model replayable adapter/system IO failures that trigger command replay.
         * delay:<resource>: applies to any command that touches that resource; resources are adapter-defined identifiers (e.g., `storage`, `network`).
     - Step addressing:
         * Steps are scheduler-issued command indices starting at 1 for the first `init`.
@@ -400,20 +457,20 @@ SCHEDULER:
   - Same seed + config => identical execution
   Semantics:
     - Commands are issued sequentially: init → apply* → (crash/restore pairs) → observe → shutdown; each issuance consumes one step index.
-    - Delays pause issuance of commands that target a blocked resource; paused commands are retried at the next step once all relevant delays expire.
+    - Delays pause issuance of commands that target a blocked resource; paused commands are replayed at the next step once all relevant delays expire.
     - Canonical fault ordering is applied per step before execution; when multiple faults affect the same step, scheduler executes them in canonical order and records no-ops explicitly for replay.
     - Shrinker replays using the same scheduler; normalized fault schedules ensure shrink steps map 1:1 to replay steps even when timing ties occur.
-  Retry and timeout handling (per command):
-    - `init`: retryable once on `retryable=true` or timeout; the system must return identical initial state. Timeout followed by retry is recorded with `timeout=true` then `retry=true` in trace.
-    - `apply`: retryable with bounded attempts; idempotent requirement enforced by invariant comparison between attempts. Retries after faults such as `io_error@step` are explicitly recorded.
-    - `crash`: retryable once on timeout/retryable error; repeated crashes must emit identical persisted `state`. If a crash fault is scheduled, the crash command still must respond with `{ok:true,state}` unless the fault prevents execution, in which case the engine records `fatal=crash_unrecoverable`.
-    - `restore`: retryable once; idempotent reconstruction from the provided `state` is mandatory. Timeout escalates to fatal on second occurrence.
-    - `observe`: retryable once; must be pure. Faults targeting observe (e.g., crash@step) cause the scheduler to issue crash handling before continuing.
-    - `shutdown`: never retried; timeout is fatal.
+  Command replay and protocol timeout handling (per command):
+    - `init`: replayable once on `retryable=true` or protocol timeout; the system must return identical initial state. Timeout followed by replay is recorded with `timeout=true` then `replay=true` in trace.
+    - `apply`: replayable with bounded attempts; idempotent requirement enforced by invariant comparison between attempts. Command replays after faults such as `io_error@step` are explicitly recorded.
+    - `crash`: replayable once on protocol timeout/replayable error; repeated crashes must emit identical persisted `state`. If a crash fault is scheduled, the crash command still must respond with `{ok:true,state}` unless the fault prevents execution, in which case the engine records `fatal=crash_unrecoverable`.
+    - `restore`: replayable once; idempotent reconstruction from the provided `state` is mandatory. Protocol timeout escalates to fatal on second occurrence.
+    - `observe`: replayable once; must be pure. Faults targeting observe (e.g., crash@step) cause the scheduler to issue crash handling before continuing.
+    - `shutdown`: never replayed; protocol timeout is fatal.
   Examples under faults:
-    - Timeout on observe: engine marks the step as `timeout`, retries observe once; second timeout => protocol error (exit code 2) with repro entry noting `command=observe`, `timeout_count=2`.
+    - Protocol timeout on observe: engine marks the step as `timeout`, replays observe once; second timeout => protocol error (exit code 2) with repro entry noting `command=observe`, `timeout_count=2`.
     - Crash during crash command: if a crash fault is injected at the crash step, engine still expects the adapter’s crash response; absence is treated as fatal mismatch and logged.
-    - Restore after delayed resources: delays block issuance until released; once restore is issued, a retryable error leads to one retry with identical `state` payload captured in trace.
+    - Restore after delayed resources: delays block issuance until released; once restore is issued, a replayable error leads to one command replay with identical `state` payload captured in trace.
 
 SIMULATION LOOP:
   - Choose seed
@@ -445,7 +502,8 @@ REPRODUCTION:
   - `nomercy replay <repro.json>` must reproduce exactly
 
 CLI (PRIMARY INTERFACE):
-  nomercy run <system>
+  nomercy beg <system>
+  nomercy pray <system>
   nomercy replay <repro.json>
   nomercy shrink <trace.json>
   nomercy explore <system>
@@ -457,6 +515,9 @@ CLI (PRIMARY INTERFACE):
     --budget <steps|time|infinite>
     --ci
     --trace
+  Qualification:
+    - `beg` performs deterministic validation without issuing simulation commands.
+    - `pray` implicitly performs qualification first when no prior success is recorded for the current adapter manifest; failures abort before any simulation run.
 
   Seed selection and reporting:
     - Default seed is derived deterministically from the adapter manifest hash + engine version (e.g., `seed = siphash(engine_version || manifest_hash)`), ensuring identical seeds for identical inputs when the user omits `--seed`.
@@ -485,8 +546,15 @@ CLI (PRIMARY INTERFACE):
     - 1: invariant failure (signals a real finding; CI should fail and archive repro)
     - 2: protocol error (malformed adapter responses, version mismatch, timeout escalation)
     - 3: adapter build/generation error (failed to compile or validate adapter)
+    - 4: system_not_deterministic (qualification failure)
     - Any other code: unexpected engine error (CI treats as infrastructure failure and should rerun)
-    - CI guidance: treat 0 as pass, 1 as fail-with-artifact, 2-3 as fail-fast needing investigation; non-listed codes should trigger a retry then escalation.
+    - CI guidance: treat 0 as pass, 1 as fail-with-artifact, 2-3 as fail-fast needing investigation; 4 rejects nondeterministic systems; non-listed codes should trigger a rerun then escalation.
+
+  Documentation and CLI guidance (informational):
+    - Determinism is a prerequisite; qualification enforces it before any simulation run.
+    - Absence of a counterexample only means “not yet found,” not proof of correctness.
+    - nomercy explores deterministic state spaces; it is not a test harness.
+    - CI usage is limited to replaying known repros; exploratory simulation is expected to run continuously outside CI.
 
   CLI output format (deterministic, parser-friendly):
     - Output is plain text, not YAML; indentation is two spaces for nested blocks.
@@ -565,11 +633,21 @@ CONTINUOUS SIMULATION MODEL:
   - CI replays known repro corpus only
   - Bugs are treated as discovered counterexamples
 
+COMMON CAUSES OF SYSTEM REJECTION (APPENDIX):
+  - Use of unordered collections with iteration-dependent behavior
+  - Internal generation of random or time-based identifiers
+  - Reading system time or randomness
+  - Emitting non-canonical JSON
+  - Observation shape instability
+  - Floating-point nondeterminism
+  - Implicit reliance on exactly-once execution
+  - Undeclared side effects or IO
+
 NON-GOALS:
   - Probabilistic testing or fuzzing
   - Thread realism
   - Unit-test replacement
-  - Implicit retries or magic behavior
+  - Implicit command replays or magic behavior
   - User-written adapters
 
 SLOGAN:
