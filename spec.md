@@ -104,8 +104,12 @@ ADAPTER MODEL (AUTO-GENERATED):
     - Default flow: adapters are generated at build time (binding-specific build step) and validated on first CLI run
     - First-run safeguard: if no artifact exists or hashes drift, CLI triggers regeneration before executing schedules
     - Determinism enforcement:
-        * Generator computes a checksum over: user-decorated sources, binding version, nomercy-core version, protocol version, generator flags, manifest schema
-        * Checksum is stored in `adapter.manifest.json` and mirrored in a `adapter.checksum` file inside the bundle
+        * Generator computes a checksum over: user-decorated sources, binding version, nomercy-core version, protocol version, generator flags, manifest schema. The checksum is the SHA-256 digest of the concatenation of these inputs encoded in canonical UTF-8 JSON, with the manifest serialized **excluding** the `checksum` field to avoid self-reference.
+        * Authoritative checksum location for validation is `adapter.checksum`; `adapter.manifest.json` includes the same value in a `checksum` field for debugging only. CLI compares its recomputed digest against `adapter.checksum` and refuses execution if they differ.
+        * Regeneration and refusal rules:
+            - If `adapter.checksum` is missing, mismatched, or cannot be parsed, CLI regenerates the adapter; if regeneration fails, it aborts with exit code 3.
+            - If `adapter.manifest.json` embeds a checksum that disagrees with `adapter.checksum`, CLI treats the adapter as stale and regenerates from sources; regeneration rewrites both files so they converge.
+            - Binding generators must compute the checksum with the manifest’s `checksum` field set to null/absent in the digest input to prevent recursion.
         * CLI recomputes the checksum before each run; mismatch => refuse to execute stale adapter and regenerate
         * Build systems (e.g., Cargo) cache by checksum; identical inputs must produce byte-identical adapter binaries
     - Artifact location:
@@ -129,9 +133,9 @@ PROTOCOL:
   - nomercy is authoritative; adapter/system is reactive
 
   Protocol versioning:
-    - All commands include a required `version` field (semantic version string)
-    - Engine sends its current version with every request; adapters must respond with the same version
-    - Mismatched or missing versions are fatal: engine aborts the session and records a repro
+    - All commands include a required `version` field (semantic version string).
+    - Engine sends its current version with every request; adapters must respond with the same `version` value in every response object (including errors and observations).
+    - Mismatched or missing versions are fatal: engine aborts the session and records a repro; validation rejects responses where `version` is absent, null, or differs from the request.
 
   Command lifecycle and shutdown semantics:
     - `shutdown` means: stop accepting new commands, flush any buffered output, exit cleanly
@@ -147,21 +151,26 @@ PROTOCOL:
     { "version": "x.y.z", "cmd": "shutdown" }
 
   Error handling and response schema:
-    - Success: { "ok": true }
-    - Retryable error: { "error": "...", "retryable": true, "fatal": false }
-    - Fatal error: { "error": "...", "fatal": true }
-    - Observation response (unchanged): { "observation": {...} }
+    - Success: { "version": "x.y.z", "ok": true }
+    - Retryable error: { "version": "x.y.z", "error": "...", "retryable": true, "fatal": false }
+    - Fatal error: { "version": "x.y.z", "error": "...", "fatal": true }
+    - Observation response: { "version": "x.y.z", "observation": {...} }
+    - Crash response: { "version": "x.y.z", "ok": true, "state": {...} } where `state` is the persisted payload that restore consumes.
+    - Restore acknowledgment: { "version": "x.y.z", "ok": true }
     - Unknown fields in adapter responses are ignored but recorded in trace for debugging
-    - Invalid JSON or missing required fields => fatal; engine aborts and emits repro
+    - Invalid JSON or missing required fields (including `version`) => fatal; engine aborts and emits repro
 
     Example responses:
-      - Retryable: { "error": "transient IO", "retryable": true, "fatal": false }
-      - Fatal: { "error": "state divergence", "fatal": true }
+      - Retryable: { "version": "1.2.3", "error": "transient IO", "retryable": true, "fatal": false }
+      - Fatal: { "version": "1.2.3", "error": "state divergence", "fatal": true }
+      - Observation: { "version": "1.2.3", "observation": { "balances": { "alice": 10 } } }
+      - Crash with persisted state: { "version": "1.2.3", "ok": true, "state": { "disk": { ... } } }
 
     Engine decisions (simplified):
       | Condition                                 | Engine action                |
       |-------------------------------------------|-----------------------------|
-      | Retryable error on apply/init/observe     | Retry command (bounded)     |
+      | Retryable error on init/apply/observe     | Retry command (bounded)     |
+      | Timeout on retryable command              | Retry once, then fatal      |
       | Fatal error flag                          | Abort run, emit repro       |
       | Invalid/malformed JSON                    | Abort run, emit repro       |
       | Version mismatch                          | Abort session, emit repro   |
@@ -170,7 +179,7 @@ PROTOCOL:
   Adapter timeouts & backpressure:
     - Max bytes per line: 64 KiB (lines exceeding are truncated and marked)
     - Max response latency: 5s default per command (configurable); exceeding triggers timeout
-    - On timeout: engine treats as retryable once; repeated timeout becomes fatal
+    - On timeout: engine treats as retryable once; repeated timeout becomes fatal. Timeout replay captures the raw command, missing response marker, and whether a retry was issued in the trace.
     - On truncation/partial write: engine marks response as incomplete, aborts current run, and records repro with raw line
     - Adapters must flush stdout after every response; engine never waits for stderr
 
@@ -180,14 +189,30 @@ PROTOCOL:
     - Fields with wrong types are treated as malformed JSON => fatal abort
 
   Idempotency and retries:
-    - `apply` must be idempotent across retries: identical command replays must not produce diverging state
-    - Engine may retry `apply` after retryable errors or timeouts; adapters must ensure apply replay is safe
-    - `init`, `restore`, and `observe` are treated as pure/side-effect-free relative to retries
+    - `apply` must be idempotent across retries: identical command replays must not produce diverging state.
+    - Command retry + idempotency matrix:
+        * `init`: may be retried once on retryable error/timeout; must recreate identical initial state and persisted artifacts.
+        * `apply`: may be retried; must be idempotent with respect to both volatile and persisted state.
+        * `restore`: may be retried; must be a pure function of the provided `state` and must not attempt external recovery side effects.
+        * `observe`: may be retried; must be read-only and deterministic.
+        * `crash`: may be retried; must emit identical `state` payloads across retries and must not attempt to continue execution after emitting state.
+        * `shutdown`: must not be retried; timeouts are treated as fatal.
+    - Engine may retry `init`, `apply`, `restore`, `observe`, and `crash` once after retryable errors or timeouts; adapters must ensure replay is safe. Non-retryable/fatal errors abort immediately.
 
-  Responses from adapter/system:
-    { "ok": true }
-    { "error": "...", "fatal": true }
-    { "observation": {...} }
+  Responses from adapter/system must echo `version`:
+    { "version": "x.y.z", "ok": true }
+    { "version": "x.y.z", "error": "...", "fatal": true }
+    { "version": "x.y.z", "observation": {...} }
+    { "version": "x.y.z", "ok": true, "state": {...} }
+
+  Crash state capture and restore input shape:
+    - Crash responses MUST include `state` when persistence exists; `state` is a JSON object representing the complete persisted view required to restart the system. Empty objects are allowed when no persistence is present.
+    - Restore requests replay the exact payload previously emitted by crash: { "version": "x.y.z", "cmd": "restore", "state": <state-object> }.
+    - Engine behavior:
+        * Every crash response line is recorded verbatim in the trace, including `state`; repros persist the latest crash `state` used during the failing schedule and include it in both `trace.json` and `repro.json`.
+        * On timeout before a crash response, engine records a timeout marker and may retry once; if a retry succeeds, the persisted `state` from the successful retry is what traces/repros capture.
+        * Mismatched/malformed `state` during restore (type mismatch, missing required keys per manifest) is fatal and recorded with the offending payload.
+    - Adapters must guarantee that repeated crash executions under retry produce byte-identical `state` payloads so restore replay is deterministic.
 
 OBSERVATIONS:
   - Free-form JSON object
@@ -201,7 +226,7 @@ OBSERVATIONS:
   - Deterministic serialization requirements:
       * Canonical JSON: stable key ordering, deterministic number formatting, and no incidental fields (timestamps, random IDs).
       * No binary blobs; payloads must be UTF-8 JSON and should avoid base64 unless essential.
-      * Observations must not exceed recommended limits: 256 KiB per observation, max nesting depth of 8, and no arrays longer than 10,000 elements.
+      * Observations must not exceed limits: 256 KiB per observation, max nesting depth of 8, and no arrays longer than 10,000 elements. Violations are fatal protocol errors; engine aborts the run, records the offending observation (truncated to 64 KiB for logging only), and writes the failure into the trace/repro with a `reason=observation_limit` marker.
       * Serialization is pure: identical input state yields byte-identical output, including field ordering and whitespace.
   - Recommended payload limits:
       * Prefer summarized counts over unbounded lists; explicitly document truncation behavior if applied.
@@ -230,11 +255,52 @@ INVARIANTS:
   Invariant representation (canonical, binding-friendly):
     - User-facing APIs are language-native (e.g., Rust macros, decorators); users never write a separate DSL.
     - Bindings compile language-native predicates into a canonical declarative form consumed by nomercy-core.
-    - Supported predicate building blocks:
-        * forall <path> <predicate>
-        * sum(<path>) == <value>
-        * Equality and ordering checks
-        * Deterministic evaluation only; no user-defined functions
+    - Canonical predicate grammar (JSON shape, not a text DSL):
+        * All predicates are JSON objects tagged by `kind`.
+        * Path syntax uses JSONPath-like segments with dot-delimited keys and `*` for map wildcards, `[*]` for arrays. Paths are deterministic and must not include filters or arithmetic.
+        * Quantifiers and aggregations operate over paths that resolve to arrays or objects.
+        * Allowed `kind` values and shapes (JSON Schema style):
+            - Equality/ordering:
+              `{ "kind": "cmp", "op": "eq|ne|lt|lte|gt|gte", "left": <expr>, "right": <expr> }`
+            - Logical combinators:
+              `{ "kind": "and", "predicates": [<predicate>, ...] }`
+              `{ "kind": "or", "predicates": [<predicate>, ...] }`
+              `{ "kind": "not", "predicate": <predicate> }`
+            - Quantifier:
+              `{ "kind": "forall", "path": "<json-path>", "predicate": <predicate> }`
+            - Aggregation:
+              `{ "kind": "aggregate", "agg": "sum|min|max|count", "path": "<json-path>", "op": "eq|ne|lt|lte|gt|gte", "value": <number> }`
+            - Constant/field references:
+              Expressions inside `cmp.left/right` can be literals (`null`, boolean, number, string) or `{ "kind": "field", "path": "<json-path>" }`.
+    - Serialization rules:
+        * Canonical predicates are serialized as canonical JSON with stable key ordering and no extraneous fields.
+        * Paths are required to be absolute within the observation root; leading `$` is rejected to avoid duplicates (`balances.*` not `$..balances.*`).
+        * Aggregations operate over numeric values only; non-numeric elements cause validation failure at load time.
+        * Quantified predicates apply the inner predicate to each resolved element; empty collections evaluate to true.
+    - Rejection/validation rules:
+        * Unknown `kind`, `agg`, or `op` values are fatal at invariant load.
+        * Missing required keys (`kind`, `op`, `path`, etc.) are fatal.
+        * Mixed-type comparisons (e.g., string vs number) are rejected before execution.
+        * Nested quantifiers must be well-founded; cycles via `field` references are impossible and need not be detected.
+    - Encoded examples:
+        * Non-negative balances:
+          ```
+          { "name": "ledger.balance_nonnegative",
+            "predicate": { "kind": "forall", "path": "balances.*", "predicate":
+              { "kind": "cmp", "op": "gte", "left": { "kind": "field", "path": "balances.*" }, "right": 0 } },
+            "message": "negative balance detected" }
+          ```
+        * Sum preserved:
+          ```
+          { "kind": "aggregate", "agg": "sum", "path": "balances.*", "op": "eq", "value": 0 }
+          ```
+        * Positive transfer amounts:
+          ```
+          { "kind": "forall", "path": "transfers[*]", "predicate":
+            { "kind": "cmp", "op": "gt",
+              "left": { "kind": "field", "path": "transfers[*].amount" },
+              "right": 0 } }
+          ```
     - Binding responsibility:
         * Reject host-language predicates that cannot be lowered to the canonical form.
         * Preserve invariant names and messages verbatim when emitting canonical predicates.
@@ -337,6 +403,17 @@ SCHEDULER:
     - Delays pause issuance of commands that target a blocked resource; paused commands are retried at the next step once all relevant delays expire.
     - Canonical fault ordering is applied per step before execution; when multiple faults affect the same step, scheduler executes them in canonical order and records no-ops explicitly for replay.
     - Shrinker replays using the same scheduler; normalized fault schedules ensure shrink steps map 1:1 to replay steps even when timing ties occur.
+  Retry and timeout handling (per command):
+    - `init`: retryable once on `retryable=true` or timeout; the system must return identical initial state. Timeout followed by retry is recorded with `timeout=true` then `retry=true` in trace.
+    - `apply`: retryable with bounded attempts; idempotent requirement enforced by invariant comparison between attempts. Retries after faults such as `io_error@step` are explicitly recorded.
+    - `crash`: retryable once on timeout/retryable error; repeated crashes must emit identical persisted `state`. If a crash fault is scheduled, the crash command still must respond with `{ok:true,state}` unless the fault prevents execution, in which case the engine records `fatal=crash_unrecoverable`.
+    - `restore`: retryable once; idempotent reconstruction from the provided `state` is mandatory. Timeout escalates to fatal on second occurrence.
+    - `observe`: retryable once; must be pure. Faults targeting observe (e.g., crash@step) cause the scheduler to issue crash handling before continuing.
+    - `shutdown`: never retried; timeout is fatal.
+  Examples under faults:
+    - Timeout on observe: engine marks the step as `timeout`, retries observe once; second timeout => protocol error (exit code 2) with repro entry noting `command=observe`, `timeout_count=2`.
+    - Crash during crash command: if a crash fault is injected at the crash step, engine still expects the adapter’s crash response; absence is treated as fatal mismatch and logged.
+    - Restore after delayed resources: delays block issuance until released; once restore is issued, a retryable error leads to one retry with identical `state` payload captured in trace.
 
 SIMULATION LOOP:
   - Choose seed
@@ -364,6 +441,7 @@ REPRODUCTION:
       * fault schedule
       * minimal trace
       * invariant name
+      * last persisted crash `state` payload if a crash occurred before failure (mirrors the line recorded in trace)
   - `nomercy replay <repro.json>` must reproduce exactly
 
 CLI (PRIMARY INTERFACE):
@@ -409,6 +487,21 @@ CLI (PRIMARY INTERFACE):
     - 3: adapter build/generation error (failed to compile or validate adapter)
     - Any other code: unexpected engine error (CI treats as infrastructure failure and should rerun)
     - CI guidance: treat 0 as pass, 1 as fail-with-artifact, 2-3 as fail-fast needing investigation; non-listed codes should trigger a retry then escalation.
+
+  CLI output format (deterministic, parser-friendly):
+    - Output is plain text, not YAML; indentation is two spaces for nested blocks.
+    - Headings are unindented identifiers ending with `:` (e.g., `config:`).
+    - Entries inside a block are `key=value` pairs indented by two spaces; values never contain newlines.
+    - EBNF:
+      ```
+      output   ::= (heading block?)* status
+      heading  ::= IDENT ':' LF
+      block    ::= (INDENT entry LF)+
+      entry    ::= IDENT '=' VALUE
+      status   ::= 'status=' IDENT LF?
+      INDENT   ::= '  '
+      ```
+    - Parsers may safely ignore unknown headings; ordering is stable per command.
 
   Minimal deterministic CLI output (copy/paste friendly):
     run:
