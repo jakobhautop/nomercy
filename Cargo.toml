@@ -2,7 +2,7 @@
 members = [
   "crates/nomercy-core",
   "crates/nomercy-cli",
-  "crates/flake",
+  "crates/flaky_sessions",
 ]
 resolver = "2"
 
