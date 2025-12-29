@@ -1,10 +1,8 @@
 [package]
-name = "flake"
+name = "flaky_sessions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
-nomercy-core = { path = "../nomercy-core" }
-serde.workspace = true

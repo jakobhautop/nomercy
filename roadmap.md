@@ -38,8 +38,8 @@ This roadmap distills the initial feature set from `spec.md` into actionable mil
 - Checksum validation and regeneration rules; refusal on drift or missing artifacts.
 - Adapter purity: deterministic protocol translation only (no IO/time/env beyond manifest).
 
-## Mock System: Flake
-- In-repo deterministic mock (`flake`) implementing the full lifecycle (init/apply/crash/restore/observe).
+## Mock System: FlakySessions
+- In-repo deterministic mock (`flaky_sessions`) implementing the full lifecycle (init/apply/crash/restore/observe).
 - Used by CLI scaffolding and integration-style tests to validate engine flows without an external codebase.
 
 ## Language Bindings (future)
