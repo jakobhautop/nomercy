@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+name = "nomercy"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+nomercy-macros = { path = "../nomercy-macros" }

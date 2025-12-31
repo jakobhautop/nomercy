@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use nomercy::prelude::*;
+
 pub type SessionId = String;
 
 #[derive(Debug, Clone)]
@@ -8,7 +10,8 @@ pub struct Session {
     pub active: bool,
 }
 
-#[derive(Debug, Default)]
+#[system]
+#[derive(Debug, Default, Clone)]
 pub struct State {
     sessions: BTreeMap<SessionId, Session>,
     next_id: u64,
@@ -22,27 +25,25 @@ impl State {
         }
     }
 
+    #[op]
     pub fn create(&mut self, user: String) -> SessionId {
         let id = format!("s{}", self.next_id);
         self.next_id += 1;
 
-        self.sessions.insert(
-            id.clone(),
-            Session {
-                user,
-                active: true,
-            },
-        );
+        self.sessions
+            .insert(id.clone(), Session { user, active: true });
 
         id
     }
 
+    #[op]
     pub fn revoke(&mut self, session_id: &str) {
         if let Some(s) = self.sessions.get_mut(session_id) {
             s.active = false;
         }
     }
 
+    #[op]
     pub fn validate(&self, session_id: &str) -> bool {
         self.sessions
             .get(session_id)
