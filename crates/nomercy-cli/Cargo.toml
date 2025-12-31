@@ -9,4 +9,3 @@ authors.workspace = true
 clap.workspace = true
 nomercy-core = { path = "../nomercy-core" }
 serde_json.workspace = true
-flaky_sessions = { path = "../flaky_sessions" }
